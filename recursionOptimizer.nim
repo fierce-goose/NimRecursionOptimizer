@@ -354,7 +354,8 @@ macro optimizeTailRecursion*(f: untyped): untyped =
             BECAUSE IDK HOW TO MAKE FUNCTION FOR IT.
       ]##
 
-      f.optimizeTailRecursionImpl()
+      result = f
+      result.optimizeTailRecursionImpl()
 
 
 
