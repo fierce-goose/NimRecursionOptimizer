@@ -6,6 +6,7 @@ type
             name: NimNode
             paramType: NimNode
             defaultValue: NimNode
+
       RecursionOptimizationFlag* {.pure.} = enum
             ConvertOpenArrayToSeq
             ConvertVarargsToSeq
