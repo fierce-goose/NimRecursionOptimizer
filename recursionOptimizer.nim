@@ -1,15 +1,27 @@
 import std/macros
 
 
-type Param = object
-      name: NimNode
-      paramType: NimNode
-      defaultValue: NimNode
+type
+      Param = object
+            name: NimNode
+            paramType: NimNode
+            defaultValue: NimNode
+      RecursionOptimizationFlag* {.pure.} = enum
+            ConvertOpenArrayToSeq
+            ConvertVarargsToSeq
+
 
 
 const
       routineKinds = {nnkFuncDef, nnkProcDef, nnkMethodDef, nnkIteratorDef}
       callKinds = {nnkCall, nnkCommand}
+
+
+
+func toSeq[T](oa: openArray[T]): seq[T] =
+      result = @[]
+      for a in oa:
+            result.add a
 
 
 
@@ -26,7 +38,8 @@ func deepLast(node: NimNode): NimNode =
                           nnkElse, nnkElseExpr,
                           nnkCaseStmt, nnkOfBranch,
                           nnkStmtList, nnkStmtListExpr,
-                          nnkBlockStmt, nnkBlockExpr}:
+                          nnkBlockStmt, nnkBlockExpr,
+                          nnkWhileStmt, nnkForStmt}:
             result = last
       else:
             result = last.deepLast()
@@ -201,22 +214,37 @@ func checkShadowing(f: NimNode) =
                               error("Params must not be shadowed", name)
 
 
-func checkParams(f: NimNode) =
+func checkParams(f: NimNode, flags: set[RecursionOptimizationFlag]) =
       f.expectKind routineKinds
+
       for param in f.getParams():
-            # if paramType is varargs
-            if (param.paramType.kind == nnkBracketExpr) and
-                                    (param.paramType[0] == ident"varargs"):
-                  error("Do not use `varargs`, use `openArray` instead",
+            let
+                  isVarargs = (param.paramType.kind == nnkBracketExpr) and
+                                    (param.paramType[0] == ident"varargs")
+                  isOpenArray = (param.paramType.kind == nnkBracketExpr) and
+                                      (param.paramType[0] == ident"openArray")
+
+            if (isVarargs) and (ConvertVarargsToSeq notin flags):
+                  error("If you want to use `varargs`, you should add " &
+                                                "`ConvertVarargsToSeq` flag",
+                        param.paramType[0])
+            elif (isOpenArray) and (ConvertOpenArrayToSeq notin flags):
+                  error("If you want to use `openArray`, you should add " &
+                                                "`ConvertOpenArrayToSeq` flag",
                         param.paramType[0])
 
 
 
-func optimizeTailRecursionImpl(f: NimNode) =
+func optimizeTailRecursionImpl(f: NimNode,
+                               flags: set[RecursionOptimizationFlag]): NimNode =
       f.expectKind routineKinds
 
       f.checkShadowing()
-      f.checkParams()
+      f.checkParams(flags)
+
+
+      result = f
+
 
       let
             body = f.body
@@ -274,7 +302,7 @@ func optimizeTailRecursionImpl(f: NimNode) =
       let
             params = f.getParams()
             args = selfcall.getArgs(f)
-            tmpBody = newStmtList()
+            newBody = newStmtList()
 
 
       #[
@@ -287,11 +315,31 @@ func optimizeTailRecursionImpl(f: NimNode) =
       ]#
 
       for param in params:
-            let name = param.name
+            let
+                  name = param.name
+                  isVarargs = (param.paramType.kind == nnkBracketExpr) and
+                                    (param.paramType[0] == ident"varargs")
+                  isOpenArray = (param.paramType.kind == nnkBracketExpr) and
+                                      (param.paramType[0] == ident"openArray")
 
-            tmpBody.add(quote do:
-                  var `name` = `name`
-            ) 
+            # converting `varargs` and `openArray` to seq,
+            # because these types not allowed for vars
+            if (isVarargs) and (ConvertVarargsToSeq in flags):
+                  let seqFromVarargs = newCall(bindSym"toSeq", name)
+
+                  newBody.add(quote do:
+                        var `name` = `seqFromVarargs`
+                  )
+            elif (isOpenArray) and (ConvertOpenArrayToSeq in flags):
+                  let seqFromOpenArray = newCall(bindSym"toSeq", name)
+
+                  newBody.add(quote do:
+                        var `name` = `seqFromOpenArray`
+                  )
+            else:
+                  newBody.add(quote do:
+                        var `name` = `name`
+                  ) 
 
 
       # `fnName(1, c=3, b=2)` -> `(a, b, c) = (1, 2, 3)`
@@ -313,32 +361,46 @@ func optimizeTailRecursionImpl(f: NimNode) =
       # if `deepLast` (i.e. `(a, b, c) = (1, 2, 3)`) is last statement,
       # then we don't need `continue` and `break` in the end
       if deepLast == body.last:
-            tmpBody.add(quote do:
+            newBody.add(quote do:
                   while true:
                         `body`
             )
       else:
             deepLast.add(quote do: continue)
-            tmpBody.add(quote do:
+            newBody.add(quote do:
                   while true:
                         `body`
                         break
             )
 
-      body[] = tmpBody[]
+      body[] = newBody[]
+
 
       when defined(debugTailRecOpt):
             debugEcho f.repr()
 
 
-macro optimizeTailRecursion*(f: untyped): untyped =
+macro optimizeTailRecursion*(
+      flags: static set[RecursionOptimizationFlag],
+      f: untyped
+): untyped =
       ##[
             This pragma optimizes tail-recursion, if it exist,
             by transforming recursive function to iterative.
             It can handle `func`s, `proc`s, `method`s and `iterator`s.
 
+            If you want to use `varargs` or `openArray` params in your function,
+            add the `ConvertVarargsToSeq` or `ConvertOpenArrayToSeq` flag.
+            With these flags you still can call your function anywhere outside
+            of its body with `varargs`/`openArray` params,
+            but inside its body you should handle these params like `seq`s
+            (even in self-calls).
+
             You can compile with `-d:debugTailRecOpt`,
             to print the transformed functions.
+
+            Restrictions:
+            =============
 
             - DO NOT USE `arg.func` (without parentheses) FOR TAIL SELF-CALL,
             BECAUSE IN AST IT HAS NO DIFFERENCE WITH `obj.field`.
@@ -347,25 +409,27 @@ macro optimizeTailRecursion*(f: untyped): untyped =
             - DO NOT SHADOW FUNCTION PARAMETERS,
             THIS MACRO ALREADY SHADOWS THEM!!!!!!!!!!!!
 
-            - DO NOT USE `varargs`,
-            I CAN'T CREATE `varargs` VARIABLE!!!!!!!!!!!!
-
             - CHECK THE ARG TYPES IN THE SELF-CALL YOURSELF,
             BECAUSE IDK HOW TO MAKE FUNCTION FOR IT.
       ]##
 
-      result = f
-      result.optimizeTailRecursionImpl()
+      f.optimizeTailRecursionImpl(flags)
+
+
+# macro optimizeTailRecursion*(f: untyped): untyped =
+#       f.optimizeTailRecursionImpl({})
 
 
 
 runnableExamples:
-      func factorial(n: int, acc: int = 1): int {.optimizeTailRecursion.} =
+
+      func factorial(n: int, acc: int = 1): int {.optimizeTailRecursion: {}.} =
             if n <= 1: result = acc
             else: result = factorial(n-1, n*acc)
 
-      iterator items[T](oa: openArray[T]): T {.optimizeTailRecursion.} =
+      iterator myItems[T](oa: openArray[T]
+      ): T {.optimizeTailRecursion: {ConvertOpenArrayToSeq}.} =
             if oa.len > 0:
                   yield oa[0]
-                  oa[1..^1].items()
+                  oa[1..^1].myItems()
 
